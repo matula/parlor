@@ -182,15 +182,16 @@ if __name__ == "__main__":
     is_apple = sys.platform == "darwin" and platform.machine() == "arm64"
 
     print("=" * 60)
-    if is_apple:
-        print("  TTS Benchmark: kokoro-onnx vs mlx-audio")
-    else:
-        print("  TTS Benchmark: kokoro-onnx")
+    print("  TTS Benchmark")
     print(f"  Warmup: {WARMUP} runs, Measured: {RUNS} runs")
     print("=" * 60)
 
-    onnx_results = benchmark_kokoro_onnx()
-    print_results("kokoro-onnx (ONNX Runtime, CPU)", onnx_results)
+    onnx_results = None
+    try:
+        onnx_results = benchmark_kokoro_onnx()
+        print_results("kokoro-onnx (ONNX Runtime, CPU)", onnx_results)
+    except ImportError:
+        print("\nSkipping kokoro-onnx benchmark (not installed)")
 
     if is_apple:
         mlx_results = benchmark_mlx_audio()
@@ -199,12 +200,13 @@ if __name__ == "__main__":
         streaming_results = benchmark_mlx_audio_streaming()
         print_streaming_results(streaming_results)
 
-        # Comparison
-        print(f"\n{'=' * 60}")
-        print(f"  Comparison: speedup of mlx-audio over kokoro-onnx")
-        print(f"{'=' * 60}")
-        for label in SENTENCES:
-            onnx_mean = onnx_results[label]["mean"]
-            mlx_mean = mlx_results[label]["mean"]
-            speedup = onnx_mean / mlx_mean
-            print(f"  [{label}]  {onnx_mean*1000:.0f}ms -> {mlx_mean*1000:.0f}ms  ({speedup:.2f}x {'faster' if speedup > 1 else 'slower'})")
+        if onnx_results:
+            # Comparison
+            print(f"\n{'=' * 60}")
+            print(f"  Comparison: speedup of mlx-audio over kokoro-onnx")
+            print(f"{'=' * 60}")
+            for label in SENTENCES:
+                onnx_mean = onnx_results[label]["mean"]
+                mlx_mean = mlx_results[label]["mean"]
+                speedup = onnx_mean / mlx_mean
+                print(f"  [{label}]  {onnx_mean*1000:.0f}ms -> {mlx_mean*1000:.0f}ms  ({speedup:.2f}x {'faster' if speedup > 1 else 'slower'})")

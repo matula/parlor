@@ -1,7 +1,6 @@
 """Parlor — on-device, real-time multimodal AI (voice + vision)."""
 
 import asyncio
-import base64
 import json
 import os
 import re
@@ -14,6 +13,7 @@ import numpy as np
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 
 import tts
 
@@ -30,7 +30,6 @@ def resolve_model_path() -> str:
     return hf_hub_download(repo_id=HF_REPO, filename=HF_FILENAME)
 
 
-MODEL_PATH = resolve_model_path()
 SYSTEM_PROMPT = (
     "You are a friendly, conversational AI assistant. The user is talking to you "
     "through a microphone and showing you their camera. "
@@ -46,9 +45,10 @@ tts_backend = None
 
 def load_models():
     global engine, tts_backend
-    print(f"Loading Gemma 4 E2B from {MODEL_PATH}...")
+    model_path = resolve_model_path()
+    print(f"Loading Gemma 4 E2B from {model_path}...")
     engine = litert_lm.Engine(
-        MODEL_PATH,
+        model_path,
         backend=litert_lm.Backend.GPU,
         vision_backend=litert_lm.Backend.GPU,
         audio_backend=litert_lm.Backend.CPU,
@@ -61,11 +61,19 @@ def load_models():
 
 @asynccontextmanager
 async def lifespan(app):
-    await asyncio.get_event_loop().run_in_executor(None, load_models)
+    await asyncio.to_thread(load_models)
     yield
+    if engine:
+        engine.__exit__(None, None, None)
 
 
 app = FastAPI(lifespan=lifespan)
+
+_STATIC_DIR = Path(__file__).parent / "static"
+_STATIC_DIR.mkdir(exist_ok=True)
+app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
+
+_INDEX_HTML = (Path(__file__).parent / "index.html").read_text()
 
 
 def split_sentences(text: str) -> list[str]:
@@ -76,7 +84,7 @@ def split_sentences(text: str) -> list[str]:
 
 @app.get("/")
 async def root():
-    return HTMLResponse(content=(Path(__file__).parent / "index.html").read_text())
+    return HTMLResponse(content=_INDEX_HTML)
 
 
 @app.websocket("/ws")
@@ -148,8 +156,8 @@ async def websocket_endpoint(ws: WebSocket):
             # LLM inference
             t0 = time.time()
             tool_result.clear()
-            response = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: conversation.send_message({"role": "user", "content": content})
+            response = await asyncio.to_thread(
+                lambda: conversation.send_message({"role": "user", "content": content})
             )
             llm_time = time.time() - t0
 
@@ -197,20 +205,14 @@ async def websocket_endpoint(ws: WebSocket):
                     break
 
                 # Generate audio for this sentence
-                pcm = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda s=sentence: tts_backend.generate(s)
-                )
+                pcm = await asyncio.to_thread(lambda s=sentence: tts_backend.generate(s))
 
                 if interrupted.is_set():
                     break
 
-                # Convert to 16-bit PCM and send as base64
+                # Convert to 16-bit PCM and send as binary WebSocket frame
                 pcm_int16 = (pcm * 32767).clip(-32768, 32767).astype(np.int16)
-                await ws.send_text(json.dumps({
-                    "type": "audio_chunk",
-                    "audio": base64.b64encode(pcm_int16.tobytes()).decode(),
-                    "index": i,
-                }))
+                await ws.send_bytes(pcm_int16.tobytes())
 
             tts_time = time.time() - tts_start
             print(f"TTS ({tts_time:.2f}s): {len(sentences)} sentences")

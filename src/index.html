@@ -453,8 +453,8 @@
   </div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/bundle.min.js"></script>
+<script src="/static/ort.min.js"></script>
+<script src="/static/vad-bundle.min.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 const video = $('video'), cameraToggle = $('cameraToggle');
@@ -482,10 +482,13 @@ const BAR_COUNT = 40;
 const BAR_GAP = 3;
 let waveformRAF;
 let ambientPhase = 0;
+let waveformW = 0, waveformH = 0;
 
 function initWaveformCanvas() {
   const dpr = window.devicePixelRatio || 1;
   const rect = waveformCanvas.getBoundingClientRect();
+  waveformW = rect.width;
+  waveformH = rect.height;
   waveformCanvas.width = rect.width * dpr;
   waveformCanvas.height = rect.height * dpr;
   waveformCtx.scale(dpr, dpr);
@@ -497,11 +500,9 @@ function getStateColor() {
 }
 
 function drawWaveform() {
-  const w = waveformCanvas.getBoundingClientRect().width;
-  const h = waveformCanvas.getBoundingClientRect().height;
-  waveformCtx.clearRect(0, 0, w, h);
+  waveformCtx.clearRect(0, 0, waveformW, waveformH);
 
-  const barWidth = (w - (BAR_COUNT - 1) * BAR_GAP) / BAR_COUNT;
+  const barWidth = (waveformW - (BAR_COUNT - 1) * BAR_GAP) / BAR_COUNT;
   const color = getStateColor();
   waveformCtx.fillStyle = color;
 
@@ -526,9 +527,9 @@ function drawWaveform() {
       amplitude = 0.03 + drift * 0.04;
     }
 
-    const barH = Math.max(2, amplitude * (h - 4));
+    const barH = Math.max(2, amplitude * (waveformH - 4));
     const x = i * (barWidth + BAR_GAP);
-    const y = (h - barH) / 2;
+    const y = (waveformH - barH) / 2;
 
     waveformCtx.globalAlpha = 0.3 + amplitude * 0.7;
     waveformCtx.beginPath();
@@ -612,8 +613,11 @@ function setState(newState) {
 // ── WebSocket ──
 function connect() {
   ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+  ws.binaryType = 'arraybuffer';
   ws.onopen = () => {
     setStatus('connected', 'Connected');
+    ignoreIncomingAudio = false;
+    stopPlayback();
     if (state !== 'loading') setState('listening');
   };
   ws.onclose = () => {
@@ -621,6 +625,11 @@ function connect() {
     setTimeout(connect, 2000);
   };
   ws.onmessage = ({ data }) => {
+    // Binary frames are raw PCM audio chunks
+    if (data instanceof ArrayBuffer) {
+      if (!ignoreIncomingAudio) queueAudioChunk(data);
+      return;
+    }
     const msg = JSON.parse(data);
     if (msg.type === 'text') {
       if (msg.transcription) {
@@ -628,7 +637,8 @@ function connect() {
         const lastUserMsg = userMsgs[userMsgs.length - 1];
         if (lastUserMsg) {
           const meta = lastUserMsg.querySelector('.meta');
-          lastUserMsg.innerHTML = `${msg.transcription}${meta ? meta.outerHTML : ''}`;
+          lastUserMsg.textContent = msg.transcription;
+          if (meta) lastUserMsg.appendChild(meta);
         }
       }
       addMessage('assistant', msg.text, `LLM ${msg.llm_time}s`);
@@ -636,9 +646,6 @@ function connect() {
       if (ignoreIncomingAudio) return;
       streamSampleRate = msg.sample_rate || 24000;
       startStreamPlayback();
-    } else if (msg.type === 'audio_chunk') {
-      if (ignoreIncomingAudio) return;
-      queueAudioChunk(msg.audio);
     } else if (msg.type === 'audio_end') {
       if (ignoreIncomingAudio) {
         ignoreIncomingAudio = false;
@@ -676,13 +683,16 @@ async function startCamera() {
   if (!mediaStream.getAudioTracks().length) { cameraEnabled = false; }
 }
 
+const captureCanvas = document.createElement('canvas');
+const captureCtx = captureCanvas.getContext('2d');
+
 function captureFrame() {
   if (!cameraEnabled || !video.videoWidth) return null;
-  const canvas = document.createElement('canvas');
   const scale = 320 / video.videoWidth;
-  canvas.width = 320; canvas.height = video.videoHeight * scale;
-  canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
-  return canvas.toDataURL('image/jpeg', 0.7).split(',')[1];
+  captureCanvas.width = 320;
+  captureCanvas.height = video.videoHeight * scale;
+  captureCtx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
+  return captureCanvas.toDataURL('image/jpeg', 0.7).split(',')[1];
 }
 
 // ── VAD Handlers ──
@@ -715,7 +725,7 @@ function handleSpeechEnd(audio) {
 
   setState('processing');
   setStatus('processing', 'Processing');
-  addMessage('user', '<span class="loading-dots"><span></span><span></span><span></span></span>', imageBase64 ? 'with camera' : '');
+  addMessage('user', '<span class="loading-dots"><span></span><span></span><span></span></span>', imageBase64 ? 'with camera' : '', true);
 
   const payload = { audio: wavBase64 };
   if (imageBase64) payload.image = imageBase64;
@@ -768,14 +778,11 @@ function startStreamPlayback() {
   setState('speaking');
 }
 
-function queueAudioChunk(base64Pcm) {
+function queueAudioChunk(arrayBuffer) {
   ensureAudioCtx();
 
-  // Decode base64 -> Int16 PCM -> Float32
-  const bin = atob(base64Pcm);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  const int16 = new Int16Array(bytes.buffer);
+  // Decode Int16 PCM -> Float32
+  const int16 = new Int16Array(arrayBuffer);
   const float32 = new Float32Array(int16.length);
   for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
 
@@ -810,10 +817,20 @@ function queueAudioChunk(base64Pcm) {
 }
 
 // ── UI ──
-function addMessage(role, text, meta) {
+function addMessage(role, text, meta, html) {
   const div = document.createElement('div');
   div.className = `msg ${role}`;
-  div.innerHTML = `${text}${meta ? `<div class="meta">${meta}</div>` : ''}`;
+  if (html) {
+    div.innerHTML = text;
+  } else {
+    div.textContent = text;
+  }
+  if (meta) {
+    const metaDiv = document.createElement('div');
+    metaDiv.className = 'meta';
+    metaDiv.textContent = meta;
+    div.appendChild(metaDiv);
+  }
   messagesDiv.appendChild(div);
   messagesDiv.scrollTop = messagesDiv.scrollHeight;
 }
@@ -844,8 +861,8 @@ async function init() {
     onSpeechStart: handleSpeechStart,
     onSpeechEnd: handleSpeechEnd,
     onVADMisfire: () => { console.log('VAD misfire (too short)'); },
-    onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
-    baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/",
+    onnxWASMBasePath: "/static/",
+    baseAssetPath: "/static/",
   });
 
   myvad.start();

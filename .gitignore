@@ -20,3 +20,9 @@ default.profraw
 # IDE
 .idea/
 .vscode/
+
+# Vendored JS/WASM/model files
+src/static/
+
+CLAUDE.md
+REVIEW.md
